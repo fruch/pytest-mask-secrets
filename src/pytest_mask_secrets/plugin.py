@@ -49,6 +49,37 @@ def pytest_configure(config):
     _install_logging_filter()
 
 
+def _refresh_secrets():
+    """Refresh compiled secrets regex from current environment and stash.
+
+    This allows masking secrets that are set during test collection or execution.
+    """
+    global _secrets, _secret_values
+    current = set()
+    # Auto-detect candidate names based on MASK_SECRETS_AUTO
+    if os.environ.get("MASK_SECRETS_AUTO", "") not in ("0", ""):
+        candidates = re.compile("(TOKEN|PASSWORD|PASSWD|SECRET)")
+        mine = re.compile(r"MASK_SECRETS(_AUTO)?\b")
+        current |= {os.environ[k] for k in os.environ if candidates.search(k) and not mine.match(k)}
+    # Explicit list
+    if "MASK_SECRETS" in os.environ:
+        vars_ = os.environ["MASK_SECRETS"].split(",")
+        current |= {os.environ[k] for k in vars_ if k in os.environ}
+    # Include stashed values
+    try:
+        # Access stash safely
+        if _stash is not None and mask_secrets_key in _stash:
+            current |= _stash[mask_secrets_key]
+    except Exception:
+        pass
+
+    # Merge into _secret_values so logging filter benefits too
+    if current:
+        _secret_values |= current
+        compiled = [re.escape(i) for i in _secret_values]
+        _secrets = re.compile(f"({'|'.join(compiled)})")
+
+
 class _MaskSecretsFilter(logging.Filter):
     """Logging filter that redacts any occurrence of secrets using `_secrets` and `_mask`."""
 
@@ -107,14 +138,75 @@ def _remove_logging_filter():
 def pytest_runtest_logreport(report):
     """pytest hook to remove sensitive data aka secrets from report output."""
 
+    # Ensure we have up-to-date secrets from env set by tests
+    _refresh_secrets()
+
     if _secrets is not None and _mask is not None:
+        # Redact captured sections
         report.sections = [(header, _secrets.sub(_mask, content)) for header, content in report.sections]
+
+        # Redact string longrepr variants
+        if isinstance(getattr(report, "longrepr", None), str):
+            report.longrepr = _secrets.sub(_mask, report.longrepr)
+        # Do not assign to longreprtext (read-only); just rely on other paths
+        # Traverse structured longrepr objects (pytest internal types)
+        lr = getattr(report, "longrepr", None)
+        if lr and not isinstance(lr, str):
+            # ReprCrash: message with assertion details often contains values
+            if hasattr(lr, "reprcrash") and hasattr(lr.reprcrash, "message"):
+                lr.reprcrash.message = _secrets.sub(_mask, lr.reprcrash.message)
+
+            # ReprTraceback: entries with funcargs, locals, and lines
+            if hasattr(lr, "reprtraceback"):
+                rt = lr.reprtraceback
+                # For each entry redact lines and locals
+                for entry in getattr(rt, "reprentries", []):
+                    if hasattr(entry, "lines"):
+                        entry.lines = [_secrets.sub(_mask, l) for l in entry.lines]
+                    # redact locals dump
+                    if getattr(entry, "reprlocals", None) is not None and hasattr(entry.reprlocals, "lines"):
+                        entry.reprlocals.lines = [_secrets.sub(_mask, l) for l in entry.reprlocals.lines]
+                    # redact function arguments shown
+                    if getattr(entry, "reprfuncargs", None) is not None:
+                        try:
+                            # reprfuncargs.args is typically a list of (name, value_repr)
+                            args = getattr(entry.reprfuncargs, "args", None)
+                            if isinstance(args, list):
+                                redacted = []
+                                for name, val in args:
+                                    # val may be a repr string
+                                    if isinstance(val, str):
+                                        redacted.append((name, _secrets.sub(_mask, val)))
+                                    else:
+                                        redacted.append((name, val))
+                                entry.reprfuncargs.args = redacted
+                            # Some pytest versions store it as text lines
+                            if hasattr(entry.reprfuncargs, "lines") and isinstance(entry.reprfuncargs.lines, list):
+                                entry.reprfuncargs.lines = [_secrets.sub(_mask, l) for l in entry.reprfuncargs.lines]
+                        except Exception:
+                            # Be defensive across pytest versions
+                            pass
+
+        # Also handle the chained representation used when verbose chaining is enabled
         if hasattr(report.longrepr, "chain"):
             for tracebacks, location, _ in report.longrepr.chain:
                 for entry in getattr(tracebacks, "reprentries", []):
-                    entry.lines = [_secrets.sub(_mask, l) for l in entry.lines]
-                    if getattr(entry, "reprlocals", None) is not None:
+                    if hasattr(entry, "lines"):
+                        entry.lines = [_secrets.sub(_mask, l) for l in entry.lines]
+                    if getattr(entry, "reprlocals", None) is not None and hasattr(entry.reprlocals, "lines"):
                         entry.reprlocals.lines = [_secrets.sub(_mask, l) for l in entry.reprlocals.lines]
+                    if getattr(entry, "reprfuncargs", None) is not None:
+                        try:
+                            args = getattr(entry.reprfuncargs, "args", None)
+                            if isinstance(args, list):
+                                entry.reprfuncargs.args = [
+                                    (name, _secrets.sub(_mask, val) if isinstance(val, str) else val)
+                                    for name, val in args
+                                ]
+                            if hasattr(entry.reprfuncargs, "lines") and isinstance(entry.reprfuncargs.lines, list):
+                                entry.reprfuncargs.lines = [_secrets.sub(_mask, l) for l in entry.reprfuncargs.lines]
+                        except Exception:
+                            pass
                 if hasattr(location, "message"):
                     location.message = _secrets.sub(_mask, location.message)
 
